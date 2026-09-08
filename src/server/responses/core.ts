@@ -1668,6 +1668,8 @@ export interface ConsumedComboFailure {
 
 
 export interface HandleResponsesOptions {
+  /** Internal Claude replay identity; consumed only by the final canonical Go transport. */
+  claudeGoAffinity?: { sessionLane?: string };
   /** Original live policy owner; separate from caller-specific routing/sidecar snapshots. */
   codexAuthPolicy?: CodexAuthPolicyConfig;
   turnAdmissionLease?: AdmissionLease;
@@ -2424,6 +2426,7 @@ async function applyFinalRouteRequestNormalization(args: {
   logCtx: RequestLogContext;
   inboundWire: InboundWire;
   inboundTransport?: "websocket";
+  claudeGoAffinity?: HandleResponsesOptions["claudeGoAffinity"];
 }): Promise<void> {
   const { parsed, route, config, req, logCtx, inboundWire, inboundTransport } = args;
   const effortSelector = prepareEffortNormalization(parsed, route);
@@ -2452,7 +2455,8 @@ async function applyFinalRouteRequestNormalization(args: {
   // Settle the wire once so logging, fast-mode, auth, and sidecars read the adapter
   // this request will actually use (#404).
   route.provider = resolveOpenCodeGoTransport(route.provider,
-    sessionLaneIdFromRequest(req.headers) ?? normalizeLogConversationId(req.headers.get("x-opencode-session")));
+    args.claudeGoAffinity ? args.claudeGoAffinity.sessionLane
+      : sessionLaneIdFromRequest(req.headers) ?? normalizeLogConversationId(req.headers.get("x-opencode-session")));
   route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = route.modelId;
@@ -3857,6 +3861,7 @@ async function handleResponsesInner(
     logCtx,
     inboundWire,
     inboundTransport: options.inboundTransport,
+    claudeGoAffinity: options.claudeGoAffinity,
   });
   // Attribute local auth/cooldown failures to the public selector too; exact auth may fail before
   // the normal post-resolution provider label is assigned.

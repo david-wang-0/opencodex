@@ -862,27 +862,26 @@ async function handleClaudeMessagesWithBudget(
       };
     }
   }
-  if (opencodeGoRoute) {
-    const session = req.headers.get("x-opencode-session");
-    if (session) headers.set("x-opencode-session", session);
-  }
-  const hasExplicitGoSession = opencodeGoRoute
-    && (sessionLaneIdFromRequest(headers) !== undefined
-      || normalizeLogConversationId(headers.get("x-opencode-session")) !== undefined);
-  const synthesizeGoSession = opencodeGoRoute && !hasExplicitGoSession
+  // Carry Go identity out of band: a combo's preflight target may differ from its
+  // actual dispatch/fallback target. Never add Go-only identity to replay headers.
+  const metadataGoLane = cacheKeySource === "metadata"
+    && typeof internalBody.prompt_cache_key === "string"
     && isRec(anthropicBody)
-    && conversationIdFromClaudeMetadata(isRec(anthropicBody.metadata) ? anthropicBody.metadata : undefined) !== undefined;
-  // Go can also use the Responses adapter; its eligibility gate must win on both wires.
-  if (opencodeGoRoute ? synthesizeGoSession : nativeRoute) {
+    && conversationIdFromClaudeMetadata(isRec(anthropicBody.metadata) ? anthropicBody.metadata : undefined) !== undefined
+    ? normalizeLogConversationId(uuidFromHex(internalBody.prompt_cache_key))
+    : undefined;
+  const claudeGoSessionLane = sessionLaneIdFromRequest(headers)
+    ?? normalizeLogConversationId(req.headers.get("x-opencode-session"))
+    ?? metadataGoLane;
+  if (nativeRoute && !opencodeGoRoute) {
     // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
     // clients always send their session uuid; devlog 090 follow-up: body-level
     // prompt_cache_key alone still yielded cached_tokens:0). Claude Code never sends
     // the header, so synthesize a stable per-session uuid from the same cache key.
-    // Routed Go requests need this lane too for their x-opencode-session affinity —
-    // but ONLY for a real per-session key (metadata.user_id). The system-hash fallback
+    // Use ONLY a real per-session key (metadata.user_id). The system-hash fallback
     // key is shared across Desktop conversations, and a shared session_id's backend
     // semantics are unproven (audit 133 R2#3): body prompt_cache_key only there.
-    if (cacheKeySource === "metadata" && (synthesizeGoSession || !headers.has("session_id")) && typeof internalBody.prompt_cache_key === "string") {
+    if (cacheKeySource === "metadata" && !headers.has("session_id") && typeof internalBody.prompt_cache_key === "string") {
       headers.set("session_id", uuidFromHex(internalBody.prompt_cache_key));
     }
   }
@@ -928,6 +927,7 @@ async function handleClaudeMessagesWithBudget(
     // Without this the replay would look native and a Responses-scoped wire default
     // would fire, disagreeing with the pre-flight decision above.
     inboundWire: "anthropic",
+    claudeGoAffinity: { sessionLane: claudeGoSessionLane },
     stripClaudeMainAuthForNoncanonicalForward: true,
     ...(trustedClaudeMainAuth ? { trustedClaudeMainAuth } : {}),
     // Claude's internal stored-main enrichment is not an original caller credential.
