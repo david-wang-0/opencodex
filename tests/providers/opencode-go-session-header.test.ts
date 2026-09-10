@@ -2,10 +2,14 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { clearComboSelectionState, clearComboTargetCooldowns } from "../../src/combos";
 import { providerConfigSeed } from "../../src/providers/derive";
 import { resolveOpenCodeGoTransport } from "../../src/providers/opencode-go-transport";
+import { getOrAllocateRequestSessionLane, linkRequestSessionLane } from "../../src/server/request-log-conversation";
 import { getProviderRegistryEntry } from "../../src/providers/registry";
 import { handleResponses } from "../../src/server/responses/core";
 import { handleChatCompletions } from "../../src/server/chat-completions";
 import { handleClaudeMessages } from "../../src/server/claude-messages";
+import { handleResponsesWithPolicyFallback } from "../../src/server/responses/policy-fallback";
+import type { RequestLogContext } from "../../src/server/request-log";
+import type { RouteDecisionTraceV1 } from "../../src/routing/trace";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
 
 const MUSE_MODEL = "muse-spark-1.3-contributor";
@@ -130,10 +134,15 @@ describe("OpenCode Go session affinity (#3344)", () => {
         { name: "explicit lane", headers: { session_id: "native-client-session", [SESSION_HEADER]: "client-session-a" }, metadata: "other-session", expected: "ocx_a197dbb87311c29a5fbe51140e3845ce" },
         { name: "operator override", headers: {}, metadata: "user_test_account__session_conversation-a", operator: true, expected: "operator-session" },
         { name: "invalid explicit lane", headers: { session_id: "invalid\tidentity", [SESSION_HEADER]: "invalid\tidentity" }, metadata: "user_test_account__session_conversation-a", expected: "ocx_a89540229ef781fd5f7adf92a711b436" },
-        { name: "invalid metadata", headers: {}, metadata: "invalid\u0000identity", expected: null },
-        { name: "shared system only", headers: {}, metadata: undefined, expected: null },
+        { name: "invalid metadata", headers: {}, metadata: "invalid\u0000identity", expected: "isolated" },
+        { name: "shared system only", headers: {}, metadata: undefined, expected: "isolated" },
       ]) {
       test(`Claude ${strategy} ${preliminaryAdapter} to Go uses ${identity.name} on ${model}`, async () => {
+        // Without valid identity the final Go destination still receives a
+        // request-scoped lane (#4172): well-formed, never the shared-system or
+        // metadata-derived value, and distinct across independent requests.
+        const observed: string[] = [];
+        for (const round of [1, 2]) {
         clearComboSelectionState();
         clearComboTargetCooldowns();
         const requests: Array<{ url: string; headers: Headers }> = [];
@@ -168,7 +177,14 @@ describe("OpenCode Go session affinity (#3344)", () => {
           await response.text();
           expect(response.status).toBe(200);
           expect(requests.at(-1)?.url).toStartWith("https://opencode.ai/zen/go/v1/");
-          expect(requests.at(-1)?.headers.get(SESSION_HEADER)).toBe(identity.expected);
+          const lane = requests.at(-1)?.headers.get(SESSION_HEADER);
+          if (identity.expected === "isolated") {
+            expect(lane).toMatch(/^ocx_[0-9a-f]{32}$/);
+            expect(lane).not.toBe("ocx_a89540229ef781fd5f7adf92a711b436");
+            observed.push(lane!);
+          } else {
+            expect(lane).toBe(identity.expected);
+          }
           if (strategy === "failover") {
             expect(requests).toHaveLength(2);
             expect(requests[0]?.headers.has(SESSION_HEADER)).toBe(false);
@@ -179,6 +195,12 @@ describe("OpenCode Go session affinity (#3344)", () => {
           entropy.mockRestore();
           clearComboSelectionState();
           clearComboTargetCooldowns();
+        }
+        if (identity.expected !== "isolated" && round === 1) break;
+        }
+        if (identity.expected === "isolated") {
+          expect(observed).toHaveLength(2);
+          expect(observed[0]).not.toBe(observed[1]);
         }
       });
       }
@@ -242,7 +264,8 @@ describe("OpenCode Go session affinity (#3344)", () => {
     const metadata = await captureRequest({ ...input, metadataUserId: "user_test_account__session_conversation-a" });
     const desktop = await captureRequest(input);
     expect(metadata.headers.get(SESSION_HEADER)).toBe("ocx_a89540229ef781fd5f7adf92a711b436");
-    expect(desktop.headers.has(SESSION_HEADER)).toBe(false);
+    expect(desktop.headers.get(SESSION_HEADER)).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(desktop.headers.get(SESSION_HEADER)).not.toBe("ocx_a89540229ef781fd5f7adf92a711b436");
   });
 
   test("Claude explicit Go header precedes metadata and matches native Chat affinity", async () => {
@@ -289,11 +312,11 @@ describe("OpenCode Go session affinity (#3344)", () => {
       }
     });
 
-    test(`Claude ${model} omits Go affinity without usable metadata identity`, async () => {
+    test(`Claude ${model} assigns isolated Go affinity without usable metadata identity`, async () => {
       for (const metadataUserId of [undefined, "", " \t\n ", "invalid\u0000identity", "x".repeat(4097)]) {
         const captured = await captureRequest({ claude: true, model, metadataUserId });
         expect(captured.url).toBe(url);
-        expect(captured.headers.has(SESSION_HEADER)).toBe(false);
+        expect(captured.headers.get(SESSION_HEADER)).toMatch(/^ocx_[0-9a-f]{32}$/);
         expect(captured.headers.has("session_id")).toBe(false);
       }
     });
@@ -455,12 +478,175 @@ describe("OpenCode Go session affinity (#3344)", () => {
     expect([...captured.headers.keys()].filter(name => name === SESSION_HEADER)).toHaveLength(1);
   });
 
-  test("keeps generated affinity runtime-only and omits it without a stable lane", async () => {
+  test("assigns isolated affinity without a stable lane and keeps configured headers untouched", async () => {
     const configured = opencodeGo();
     await captureRequest({ provider: configured });
     expect(configured.headers?.[SESSION_HEADER]).toBeUndefined();
-    expect(resolveOpenCodeGoTransport(configured, undefined)).toBe(configured);
-    expect(resolveOpenCodeGoTransport(configured, undefined).headers?.[SESSION_HEADER]).toBeUndefined();
+    const first = resolveOpenCodeGoTransport(configured, undefined);
+    const second = resolveOpenCodeGoTransport(configured, undefined);
+    expect(first.headers?.[SESSION_HEADER]).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(second.headers?.[SESSION_HEADER]).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(first.headers?.[SESSION_HEADER]).not.toBe(second.headers?.[SESSION_HEADER]);
+    expect(configured.headers?.[SESSION_HEADER]).toBeUndefined();
+  });
+
+  test("two independent sessionless Claude requests receive distinct Go affinities", async () => {
+    const first = await captureRequest({ claude: true, model: CHAT_MODEL });
+    const second = await captureRequest({ claude: true, model: CHAT_MODEL });
+    const firstSession = first.headers.get(SESSION_HEADER);
+    const secondSession = second.headers.get(SESSION_HEADER);
+    expect(firstSession).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(secondSession).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(firstSession).not.toBe(secondSession);
+  });
+
+  test("two independent sessionless native Chat requests receive distinct Go affinities", async () => {
+    const headers = { "content-type": "application/json" };
+    const first = await captureRequest({ nativeChat: true, model: "omen-alpha", headers });
+    const second = await captureRequest({ nativeChat: true, model: "omen-alpha", headers });
+    const firstSession = first.headers.get(SESSION_HEADER);
+    const secondSession = second.headers.get(SESSION_HEADER);
+    expect(firstSession).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(secondSession).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(firstSession).not.toBe(secondSession);
+  });
+
+  test("the same admitted request retains the same Go affinity across route normalization and retries", () => {
+    const configured = opencodeGo();
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    const lane1 = getOrAllocateRequestSessionLane(req);
+    const lane2 = getOrAllocateRequestSessionLane(req);
+    expect(lane1).toBe(lane2);
+
+    const transport1 = resolveOpenCodeGoTransport(configured, lane1);
+    const transport2 = resolveOpenCodeGoTransport(configured, lane2);
+    expect(transport1.headers?.[SESSION_HEADER]).toBe(transport2.headers?.[SESSION_HEADER]);
+  });
+
+  test("linking an admitted request forwards the allocated fallback lane to internal replay requests", () => {
+    const sourceReq = new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    const targetReq = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+    linkRequestSessionLane(sourceReq, targetReq);
+    const sourceLane = getOrAllocateRequestSessionLane(sourceReq);
+    const targetLane = getOrAllocateRequestSessionLane(targetReq);
+    expect(sourceLane).toBe(targetLane);
+  });
+
+  test("handleResponsesWithPolicyFallback retains the same Go affinity across retried candidate attempts (#4172)", async () => {
+    const trace: RouteDecisionTraceV1 = {
+      version: 1,
+      decisionId: "decision-policy-go",
+      createdAt: 1,
+      requestedModel: "policy/go-test",
+      routeKind: "policy",
+      profile: { id: "go-test", revision: "rev-1" },
+      requirements: [],
+      candidates: [
+        { provider: "opencode-go", model: MUSE_MODEL, eligible: true, exclusions: [], score: { total: 0.9, components: {} } },
+        { provider: "opencode-go", model: CHAT_MODEL, eligible: true, exclusions: [], score: { total: 0.8, components: {} } },
+      ],
+      selected: { candidateIndex: 0, provider: "opencode-go", model: MUSE_MODEL, reason: "highest-score" },
+    };
+
+    const capturedHeaders: string[] = [];
+    const capturedUrls: string[] = [];
+    globalThis.fetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(requestInput);
+      capturedUrls.push(url);
+      const headers = new Headers(init?.headers);
+      const session = headers.get(SESSION_HEADER);
+      if (session) capturedHeaders.push(session);
+      if (url.endsWith("/responses")) {
+        return Response.json({ error: { message: "rate limited upstream" } }, { status: 429 });
+      }
+      return upstreamResponse(url);
+    }) as typeof fetch;
+
+    const initialReq = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "policy/go-test", input: "ping", stream: false }),
+    });
+
+    const config = {
+      providers: { "opencode-go": opencodeGo() },
+    } as unknown as OcxConfig;
+
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
+    const response = await handleResponsesWithPolicyFallback(
+      initialReq,
+      config,
+      logCtx,
+      { inboundWire: "responses" },
+      {
+        runCore: async (candidateReq, cfg, ctx, options) => {
+          const body = await candidateReq.clone().json() as { model: string };
+          ctx.routeDecision = trace;
+          // For the initial policy request, forward as candidate 0
+          const forwardReq = body.model === "policy/go-test"
+            ? new Request(candidateReq.url, {
+                method: candidateReq.method,
+                headers: candidateReq.headers,
+                body: JSON.stringify({ ...body, model: `opencode-go/${MUSE_MODEL}` }),
+                signal: candidateReq.signal,
+              })
+            : candidateReq;
+          linkRequestSessionLane(candidateReq, forwardReq);
+          const res = await handleResponses(
+            forwardReq,
+            cfg,
+            ctx,
+            { ...options, comboAttempt: true },
+          );
+          ctx.routeDecision = trace;
+          return res;
+        },
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedUrls).toHaveLength(2);
+    expect(capturedUrls[0]).toContain("/responses");
+    expect(capturedUrls[1]).toContain("/chat/completions");
+    expect(capturedHeaders).toHaveLength(2);
+    expect(capturedHeaders[0]).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(capturedHeaders[1]).toBe(capturedHeaders[0]);
+
+    // An independent sessionless request receives a distinct Go affinity
+    const independentCaptured: string[] = [];
+    globalThis.fetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      const session = headers.get(SESSION_HEADER);
+      if (session) independentCaptured.push(session);
+      return upstreamResponse(String(requestInput));
+    }) as typeof fetch;
+
+    const secondReq = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "opencode-go/muse-spark-1.3-contributor", input: "ping", stream: false }),
+    });
+
+    const secondResponse = await handleResponses(
+      secondReq,
+      config,
+      { model: "", provider: "" } as RequestLogContext,
+      { inboundWire: "responses" },
+    );
+
+    expect(secondResponse.status).toBe(200);
+    expect(independentCaptured).toHaveLength(1);
+    expect(independentCaptured[0]).toMatch(/^ocx_[0-9a-f]{32}$/);
+    expect(independentCaptured[0]).not.toBe(capturedHeaders[0]);
   });
 
   test("does not inject the header into a lookalike destination", async () => {

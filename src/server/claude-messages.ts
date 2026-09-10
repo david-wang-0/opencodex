@@ -36,7 +36,7 @@ import { resolveWireProtocolOverride } from "./adapter-resolve";
 import type { OcxConfig } from "../types";
 import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
 import { addFinalRequestLog, httpStatusForRequestLogTerminal, recordFirstOutput, type RequestLogContext, type RequestLogEntry } from "./request-log";
-import { conversationIdFromClaudeMetadata, normalizeLogConversationId, sessionLaneIdFromRequest } from "./request-log-conversation";
+import { conversationIdFromClaudeMetadata, getOrAllocateRequestSessionLane, linkRequestSessionLane, normalizeLogConversationId, sessionLaneIdFromRequest } from "./request-log-conversation";
 import { responseWithDeferredRequestLog } from "./relay";
 import { handleResponses } from "./responses";
 import {
@@ -876,9 +876,14 @@ async function handleClaudeMessagesWithBudget(
     && conversationIdFromClaudeMetadata(isRec(anthropicBody.metadata) ? anthropicBody.metadata : undefined) !== undefined
     ? normalizeLogConversationId(uuidFromHex(internalBody.prompt_cache_key))
     : undefined;
+  // Without any valid conversation identity, fall back to the request-scoped lane
+  // allocated on the admitted client request (#4172): stable across retries and
+  // route reconstruction, distinct per request, and never derived from a shared
+  // system-prompt cache key or from a later synthesized native session_id header.
   const claudeGoSessionLane = sessionLaneIdFromRequest(headers)
     ?? normalizeLogConversationId(req.headers.get("x-opencode-session"))
-    ?? metadataGoLane;
+    ?? metadataGoLane
+    ?? getOrAllocateRequestSessionLane(req);
   if (nativeRoute && !opencodeGoRoute) {
     // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
     // clients always send their session uuid; devlog 090 follow-up: body-level
@@ -902,6 +907,7 @@ async function handleClaudeMessagesWithBudget(
         headers,
         body: JSON.stringify(internalBody),
       });
+      linkRequestSessionLane(req, internalReq);
     } finally {
       reservation.release();
     }
